@@ -99,6 +99,9 @@ def extract_education_history(text, model="llama3.2", stream=False):
         try:
             education_history = json.loads(generated_text.strip())
             if isinstance(education_history, dict):
+                for degree in ["bachelors", "masters", "phd"]:
+                    if education_history.get(degree) == "null":
+                        education_history[degree] = None
                 return education_history
             else:
                 raise ValueError("The extracted data is not a valid JSON object.")
