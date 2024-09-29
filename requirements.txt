@@ -1,0 +1,5 @@
+requests~=2.32.3
+pdfkit~=1.0.0
+pdfplumber~=0.11.4
+pandas~=2.2.3
+tqdm~=4.66.5
