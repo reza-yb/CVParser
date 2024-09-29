@@ -14,7 +14,6 @@ OUTPUT_DIR = 'cvs'  # Directory to save downloaded PDFs
 ZIP_FILENAME = 'cvs.zip'  # Name of the output ZIP file
 TIMEOUT = 10  # Timeout for HTTP requests
 ROW_RANGE = (0, 6000)  # Rows to be processed (start, end)
-LOG_FILE = 'job_placement_download.log'  # Log file path
 MAX_THREADS = 10  # Maximum number of concurrent threads
 
 # Setup logging
