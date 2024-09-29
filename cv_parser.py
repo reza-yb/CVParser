@@ -6,6 +6,7 @@ import argparse
 import csv
 import logging
 from pathlib import Path
+from tqdm import tqdm
 
 # Setup logging
 logging.basicConfig(
@@ -64,7 +65,7 @@ def extract_education_context(text, window_size=60):
         return text[match.start():end]
 
     logging.warning("No occurrence of 'education' found. processing the first sections of file only")
-    return text[:window_size*6*3]  # Return first three sections
+    return text[:window_size * 6 * 3]  # Return first three sections
 
 
 def extract_education_history(text, model="llama3.2", stream=False):
@@ -177,7 +178,9 @@ def main():
 
     # Prepare data for CSV
     csv_data = []
-    for pdf_file in pdf_files:
+
+    # Wrap the file processing loop with tqdm for progress bar
+    for pdf_file in tqdm(pdf_files, desc="Processing PDFs"):
         education_history = process_pdf_file(pdf_file)
         if education_history:
             csv_data.append({
