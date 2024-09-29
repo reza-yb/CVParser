@@ -1,4 +1,6 @@
 import re
+
+import pandas as pd
 import requests
 import json
 import pdfplumber
@@ -190,19 +192,17 @@ def main():
                 "PhD": education_history.get("phd", None)
             })
 
-    # Write to CSV
-    try:
-        with open(output_csv, mode='w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ["File Name", "Bachelors", "Masters", "PhD"]
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+    df = pd.DataFrame(csv_data)
+    df['File Name'] = df['File Name'].str.replace('.pdf', '', regex=False).astype(int)
+    df.set_index('File Name', inplace=True)
+    df.index.name = "Row Number"
+    df.sort_index(inplace=True)
 
-            writer.writeheader()
-            for row in csv_data:
-                writer.writerow(row)
+    try:
+        df.to_csv(output_csv)
         logging.info(f"CSV file has been created at {output_csv}.")
     except Exception as e:
         logging.error(f"Failed to write to CSV file {output_csv}: {e}")
-
 
 if __name__ == "__main__":
     main()
