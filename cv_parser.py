@@ -1,14 +1,16 @@
+import os
 import re
 
+import backoff
 import pandas as pd
 import requests
 import json
 import pdfplumber
 import argparse
-import csv
 import logging
 from pathlib import Path
 from tqdm import tqdm
+import openai
 
 # Setup logging
 logging.basicConfig(
@@ -16,14 +18,12 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Define the API endpoint
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
-
-# Define the headers
 HEADERS = {
     "Content-Type": "application/json"
 }
 
+openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 def extract_text_from_pdf(pdf_path):
     """
@@ -47,7 +47,7 @@ def extract_text_from_pdf(pdf_path):
     return None
 
 
-def extract_education_context(text, window_size=60):
+def extract_education_context(text, api_choice, window_size=60):
     """
     Extracts up to 30 words before and after the first occurrence of 'education' in the text.
 
@@ -57,26 +57,28 @@ def extract_education_context(text, window_size=60):
     """
     logging.debug("Extracting context around the word 'education'.")
 
-    # Find the first occurrence of the word 'education' (case-insensitive) with a word boundary
-    pattern = re.compile(r'education', re.IGNORECASE)
-    match = pattern.search(text)  # Find the first match only
+    if api_choice == "ollama":
+        # Find the first occurrence of the word 'education' (case-insensitive) with a word boundary
+        pattern = re.compile(r'education', re.IGNORECASE)
+        match = pattern.search(text)  # Find the first match only
 
-    if match:
-        # Extract 30 words before and after the first match
-        end = min(len(text), match.end() + window_size * 6)
-        return text[match.start():end]
+        if match:
+            # Extract 30 words before and after the first match
+            end = min(len(text), match.end() + window_size * 6)
+            return text[match.start():end]
 
-    logging.warning("No occurrence of 'education' found. processing the first sections of file only")
-    return text[:window_size * 6 * 3]  # Return first three sections
+        logging.warning("No occurrence of 'education' found. processing the first sections of file only")
+        return text[:window_size * 6 * 3]  # Return first three sections
+    else:
+        return text[:window_size * 6 * 20]
 
 
-def extract_education_history(text, model="llama3.2", stream=False):
+def extract_education_history_ollama(text, model="llama3.2"):
     """
-    Sends the extracted text context to the LLM to extract universities for bachelor's, master's, and PhD.
+    Sends the extracted text context to the Ollama LLM to extract universities for bachelor's, master's, and PhD.
 
     :param text: The extracted context around the word 'education'.
     :param model: The LLM model to use.
-    :param stream: Whether to stream the response.
     :return: The JSON object with universities for bachelor's, master's, and PhD, or None if failed.
     """
     prompt = (
@@ -89,7 +91,7 @@ def extract_education_history(text, model="llama3.2", stream=False):
     payload = {
         "model": model,
         "prompt": prompt,
-        "stream": stream
+        "stream": False
     }
 
     try:
@@ -111,23 +113,107 @@ def extract_education_history(text, model="llama3.2", stream=False):
         except (json.JSONDecodeError, ValueError) as e:
             logging.warning(f"Failed to parse the response as JSON. LLM's Response: {generated_text}. Error: {e}")
 
-    except requests.exceptions.HTTPError as http_err:
-        logging.error(f"HTTP error occurred: {http_err} - {response.text}")
-    except requests.exceptions.ConnectionError:
-        logging.error("Failed to connect to the LLM. Is the service running?")
-    except requests.exceptions.Timeout:
-        logging.error("The request timed out.")
-    except requests.exceptions.RequestException as err:
-        logging.error(f"An error occurred: {err}")
+    except Exception as err:
+        logging.error(f"An error occurred with Ollama API {err}", exc_info=True)
+
+    return None
+
+@backoff.on_exception(backoff.expo, openai.RateLimitError, max_tries=2)
+def completions_with_backoff(**kwargs):
+    return openai_client.chat.completions.create(**kwargs)
+
+
+def extract_education_history_openai(text, model="gpt-4o-mini"):
+    """
+    Sends the extracted text context to OpenAI API to extract universities for education trajectory and career trajectory.
+
+    :param text: The extracted context around the word 'education'.
+    :param model: The LLM model to use.
+    :return: The JSON object with education_trajectory and career_trajectory, or None if failed.
+    """
+    try:
+        prompt = """
+        You are an assistant that extracts information from an unstructured CV and returns the needed info in JSON format.
+        Extract the following from the given text:
+        1. education_trajectory: List the degrees (B.A., M.A., Ph.D.) along with university names and graduation years in this format:
+        "B.A., University Name, Year | M.A., University Name, Year | Ph.D., University Name, Year".
+        2. career_trajectory: List the career trajectory (university, start year, end year, and position) in this format:
+        "University Name, Start Year-End Year, Position | University Name, Start Year-End Year, Position". Beware phd candidate is not a career.
+        Only return the JSON object with these two keys: education_trajectory and career_trajectory.
+        """
+
+        response = completions_with_backoff(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": text
+                        }
+                    ]
+                },
+            ],
+            temperature=1,
+            max_tokens=350,
+            top_p=1,
+            frequency_penalty=0,
+            presence_penalty=0,
+            response_format={
+                "type": "json_object"
+            }
+        )
+
+        generated_text = response.choices[0].message.content
+
+        try:
+            education_history = json.loads(generated_text)
+            if isinstance(education_history, dict):
+                return education_history
+            else:
+                raise ValueError("The extracted data is not a valid JSON object.")
+        except (json.JSONDecodeError, ValueError) as e:
+            logging.warning(f"Failed to parse the response as JSON. LLM's Response: {generated_text}. Error: {e}")
+    except Exception as err:
+        logging.error(f"An error occurred with OpenAI API: {err}", exc_info=True)
 
     return None
 
 
-def process_pdf_file(pdf_path):
+def extract_education_history(text, api_choice="openai", model="gpt-4o-mini"):
     """
-    Processes a single PDF file to extract relevant education text and send to the LLM.
+    Sends the extracted text context to the chosen API (Ollama or OpenAI) to extract universities for bachelor's, master's, and PhD.
+
+    :param text: The extracted context around the word 'education'.
+    :param api_choice: The API to use ('ollama' or 'openai').
+    :param model: The LLM model to use.
+    :return: The JSON object with universities for bachelor's, master's, and PhD, or None if failed.
+    """
+    if api_choice == "ollama":
+        return extract_education_history_ollama(text, model)
+    elif api_choice == "openai":
+        return extract_education_history_openai(text, model)
+    else:
+        logging.error(f"Invalid API choice: {api_choice}")
+        return None
+
+
+def process_pdf_file(pdf_path, api_choice="openai"):
+    """
+    Processes a single PDF file to extract relevant education text and send to the chosen LLM (Ollama or OpenAI).
 
     :param pdf_path: Path to the PDF file.
+    :param api_choice: API choice, either 'ollama' or 'openai'.
     :return: Education history as a dictionary or None if extraction fails.
     """
     logging.info(f"Processing file: {pdf_path}")
@@ -136,13 +222,13 @@ def process_pdf_file(pdf_path):
         logging.warning(f"No text extracted from {pdf_path}. Skipping.")
         return None
 
-    education_context = extract_education_context(text)
+    education_context = extract_education_context(text, api_choice)
     logging.debug(f"Education context:\n {education_context}")
     if not education_context:
         logging.warning(f"No relevant education context found in {pdf_path}.")
         return None
 
-    education_history = extract_education_history(education_context)
+    education_history = extract_education_history(education_context, api_choice)
     if education_history is None:
         logging.warning(f"Failed to extract education history from {pdf_path}.")
         return None
@@ -157,10 +243,11 @@ def main():
     and compiles results into a CSV.
     """
     parser = argparse.ArgumentParser(
-        description="Extract education history from all PDFs in a directory using Ollama and compile results into a CSV."
+        description="Extract education history from all PDFs in a directory using Ollama or OpenAI and compile results into a CSV."
     )
     parser.add_argument("input_directory", help="Path to the directory containing PDF files.")
     parser.add_argument("output_csv", help="Path to the output CSV file.")
+    parser.add_argument("--api", choices=["ollama", "openai"], default="openai", help="Choose the API to use (ollama or openai).")
     args = parser.parse_args()
 
     input_dir = Path(args.input_directory)
@@ -171,7 +258,7 @@ def main():
         return
 
     # Find all PDF files in the directory
-    pdf_files = list(input_dir.glob("*.pdf"))
+    pdf_files = sorted(list(input_dir.glob("*.pdf")), key=lambda x: int(x.stem))
     if not pdf_files:
         logging.info(f"No PDF files found in the directory {input_dir}.")
         return
@@ -183,14 +270,21 @@ def main():
 
     # Wrap the file processing loop with tqdm for progress bar
     for pdf_file in tqdm(pdf_files, desc="Processing PDFs"):
-        education_history = process_pdf_file(pdf_file)
+        education_history = process_pdf_file(pdf_file, api_choice=args.api)
         if education_history:
-            csv_data.append({
-                "File Name": pdf_file.name,
-                "Bachelors": education_history.get("bachelors", None),
-                "Masters": education_history.get("masters", None),
-                "PhD": education_history.get("phd", None)
-            })
+            if args.api == "openai":
+                csv_data.append({
+                    "File Name": pdf_file.name,
+                    "education_trajectory": education_history.get("education_trajectory", None),
+                    "career_trajectory": education_history.get("career_trajectory", None)
+                })
+            elif args.api == "ollama":
+                csv_data.append({
+                    "File Name": pdf_file.name,
+                    "Bachelors": education_history.get("bachelors", None),
+                    "Masters": education_history.get("masters", None),
+                    "PhD": education_history.get("phd", None)
+                })
 
     df = pd.DataFrame(csv_data)
     df['File Name'] = df['File Name'].str.replace('.pdf', '', regex=False).astype(int)
