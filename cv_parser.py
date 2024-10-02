@@ -11,6 +11,7 @@ import logging
 from pathlib import Path
 from tqdm import tqdm
 import openai
+import concurrent.futures
 
 # Setup logging
 logging.basicConfig(
@@ -118,7 +119,7 @@ def extract_education_history_ollama(text, model="llama3.2"):
 
     return None
 
-@backoff.on_exception(backoff.expo, openai.RateLimitError, max_tries=2)
+@backoff.on_exception(backoff.constant, openai.RateLimitError, max_tries=2, interval=30)
 def completions_with_backoff(**kwargs):
     return openai_client.chat.completions.create(**kwargs)
 
@@ -237,10 +238,11 @@ def process_pdf_file(pdf_path, api_choice="openai"):
     return education_history
 
 
+
 def main():
     """
     Main entry point for the script. Extracts education history from all PDFs in a directory
-    and compiles results into a CSV.
+    and compiles results into a CSV using multithreading.
     """
     parser = argparse.ArgumentParser(
         description="Extract education history from all PDFs in a directory using Ollama or OpenAI and compile results into a CSV."
@@ -268,23 +270,31 @@ def main():
     # Prepare data for CSV
     csv_data = []
 
-    # Wrap the file processing loop with tqdm for progress bar
-    for pdf_file in tqdm(pdf_files, desc="Processing PDFs"):
+    def worker(pdf_file):
         education_history = process_pdf_file(pdf_file, api_choice=args.api)
         if education_history:
             if args.api == "openai":
-                csv_data.append({
+                return {
                     "File Name": pdf_file.name,
                     "education_trajectory": education_history.get("education_trajectory", None),
                     "career_trajectory": education_history.get("career_trajectory", None)
-                })
+                }
             elif args.api == "ollama":
-                csv_data.append({
+                return {
                     "File Name": pdf_file.name,
                     "Bachelors": education_history.get("bachelors", None),
                     "Masters": education_history.get("masters", None),
                     "PhD": education_history.get("phd", None)
-                })
+                }
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_pdf = {executor.submit(worker, pdf): pdf for pdf in pdf_files}
+
+        for future in tqdm(concurrent.futures.as_completed(future_to_pdf), total=len(future_to_pdf), desc="Processing PDFs"):
+            result = future.result()
+            if result:
+                csv_data.append(result)
 
     df = pd.DataFrame(csv_data)
     df['File Name'] = df['File Name'].str.replace('.pdf', '', regex=False).astype(int)
